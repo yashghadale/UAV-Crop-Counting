@@ -7,8 +7,12 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.optim import SGD
+import torchvision.transforms as T
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
 
 # project imports (assumes src is in python path or run from project root)
 from dataset import PlotCounterDataset
@@ -75,47 +79,92 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     # Datasets & loaders
-    train_ds = PlotCounterDataset(train_img, train_den, mode="train", patch_size=args.patch_size, patches_per_plot=args.patches_per_plot)
-    val_ds = PlotCounterDataset(val_img, val_den, mode="val")
-    test_ds = PlotCounterDataset(test_img, test_den, mode="test")
+        # Datasets & loaders
+    train_transform = T.Compose([
+    T.RandomHorizontalFlip(),
+    T.RandomVerticalFlip(),
+    T.RandomRotation(15),
+    T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    T.ToTensor(),   # <-- must be last
+    ])
+
+# Validation: no augmentation, just tensor conversion
+    val_transform = T.Compose([
+    T.ToTensor()
+    ])
+
+# Testing: same as validation
+    test_transform = T.Compose([
+    T.ToTensor()
+    ])
+
+    train_ds = PlotCounterDataset(train_img, train_den, mode="train",
+                              patch_size=args.patch_size,
+                              patches_per_plot=args.patches_per_plot,
+                              transform=train_transform)
+
+    val_ds = PlotCounterDataset(val_img, val_den, mode="val", transform=val_transform)
+    test_ds = PlotCounterDataset(test_img, test_den, mode="test", transform=test_transform)
+
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=1)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=1)
 
     # Model, loss, optimizer, scheduler
+    # 1. Create model
     model = create_model(in_ch=3, base=32, device=device).to(device)
+
+# 2. Define loss function
     criterion = nn.L1Loss(reduction="mean")
-    optimizer = SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.wd)
-    scheduler = MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
+
+# 3. Define optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+# 4. Scheduler
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)  # use args.epochs instead of hard-coded 50
+
+
 
     best_mae = float("inf")
     log_path = os.path.join(args.save_dir, "train_log.json")
+    patience = 20
+    counter = 0
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+
+        print(f"[Epoch {epoch}] LR: {scheduler.get_last_lr()[0]:.6f}")  # log current LR
         scheduler.step()
 
-        # Validation: full-plot MAE
+        # Validation
         val_metrics, _, _ = evaluate_fullplots(model, val_loader, device=device, tile=1024, overlap=64)
         val_mae = float(val_metrics["MAE"])
 
         is_best = val_mae < best_mae
         if is_best:
             best_mae = val_mae
+            counter = 0
 
-        # Save checkpoint
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "best_mae": best_mae
-        }
-        save_checkpoint(ckpt, is_best, args.save_dir, filename=f"ckpt_epoch_{epoch}.pth")
+            # Save only best checkpoint
+            ckpt = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_mae": best_mae
+            }
+            save_checkpoint(ckpt, is_best, args.save_dir, filename="best_model.pth")
+            print(f"✅ Saved new best model at epoch {epoch} with MAE={best_mae:.2f}")
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"⏹ Early stopping triggered at epoch {epoch}!")
+                break
 
-        # Log entry
+        # Log entry (always log, even if not best)
         entry = {
             "epoch": epoch,
             "train_loss": train_loss,
