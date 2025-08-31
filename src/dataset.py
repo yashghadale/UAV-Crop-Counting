@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import Dataset
 import random
 import re
+from PIL import Image
+
 
 # ----------------------
 # Natural sorting helper
@@ -49,27 +51,14 @@ def resize_half(img, dmap):
 # Dataset Class
 # ----------------------
 class PlotCounterDataset(Dataset):
-    """
-    Dataset for PlotCounter
-    - Training: returns random patches from resized images
-    - Validation/Testing: returns full resized plot
-    """
-    def __init__(self, images_dir, density_dir, mode="train", patch_size=512, patches_per_plot=20):
-        """
-        Args:
-            images_dir (str): Path to plot images
-            density_dir (str): Path to density maps (.npy or image files)
-            mode (str): "train" | "val" | "test"
-            patch_size (int): Size of cropped patch (default: 512)
-            patches_per_plot (int): Number of patches per plot (train mode only)
-        """
+    def __init__(self, images_dir, density_dir, mode="train", patch_size=512, patches_per_plot=20, transform=None):
         self.images_dir = images_dir
         self.density_dir = density_dir
         self.mode = mode
         self.patch_size = patch_size
         self.patches_per_plot = patches_per_plot
+        self.transform = transform
 
-        # Collect files
         self.image_files = sorted(
             [f for f in os.listdir(images_dir) if f.endswith((".jpg", ".png"))],
             key=natural_key
@@ -84,14 +73,13 @@ class PlotCounterDataset(Dataset):
 
     def __len__(self):
         if self.mode == "train":
-            # Each epoch generates (plots × patches_per_plot) samples
             return len(self.image_files) * self.patches_per_plot
         else:
             return len(self.image_files)
 
     def __getitem__(self, idx):
+        from PIL import Image
         if self.mode == "train":
-            # Select which plot this idx corresponds to
             plot_idx = idx // self.patches_per_plot
             img_path = os.path.join(self.images_dir, self.image_files[plot_idx])
             dmap_path = os.path.join(self.density_dir, self.density_files[plot_idx])
@@ -99,7 +87,7 @@ class PlotCounterDataset(Dataset):
             img = load_image(img_path)
             dmap = load_density_map(dmap_path)
 
-            # Resize by 0.5
+            # Resize
             img, dmap = resize_half(img, dmap)
             h, w = img.shape[:2]
 
@@ -110,22 +98,33 @@ class PlotCounterDataset(Dataset):
             img_patch = img[y:y+self.patch_size, x:x+self.patch_size]
             dmap_patch = dmap[y:y+self.patch_size, x:x+self.patch_size]
 
-            # Convert to tensors
-            img_patch = torch.from_numpy(img_patch.transpose(2, 0, 1)).float() / 255.0
-            dmap_patch = torch.from_numpy(dmap_patch).unsqueeze(0)
+            # Convert to PIL for transforms
+            img_patch = Image.fromarray(img_patch)
+
+            if self.transform:
+                img_patch = self.transform(img_patch)
+            else:
+                img_patch = T.ToTensor()(img_patch)
+
+            dmap_patch = torch.from_numpy(dmap_patch).unsqueeze(0).float()
 
             return img_patch, dmap_patch
 
-        else:  # validation or testing -> full plot
+        else:  # val / test
             img_path = os.path.join(self.images_dir, self.image_files[idx])
             dmap_path = os.path.join(self.density_dir, self.density_files[idx])
 
             img = load_image(img_path)
             dmap = load_density_map(dmap_path)
-
             img, dmap = resize_half(img, dmap)
 
-            img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
-            dmap_tensor = torch.from_numpy(dmap).unsqueeze(0)
+            img = Image.fromarray(img)
+
+            if self.transform:
+                img_tensor = self.transform(img)
+            else:
+                img_tensor = T.ToTensor()(img)
+
+            dmap_tensor = torch.from_numpy(dmap).unsqueeze(0).float()
 
             return img_tensor, dmap_tensor, self.image_files[idx]
